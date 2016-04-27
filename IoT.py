@@ -94,23 +94,37 @@ class Thermostat:
     _pir = None
     _mic = None
 
-    # Cache/State:
-    _status = None
-    _temp = 0.0
-    _mode = "schedule"  # Operating mode: schedule/manual/override
+    # Cache/State: Generally not communicated to the cloud
+    _status = None      # Cache for device status 
+    _temp = 0.0         # Last-read temperature
+    _mode = "schedule"  # Operating mode: schedule/activity/manual
     _activity = None    # Points to which activity override is active, if any
     _scheduled = None   # Currently scheduled program
     _next = 0           # Time to next schedule
     _statdata = None    # Statistics for the last window
     _statistics = None  # Statistics for the current window
+    _timer = None       # Timer obj for schedule change.
+    _expiryTime = None  # Time at which activity mode, if enabled, will expire
+    _lastAct = False    # Previous activity state
 
     # Settings
-    _settings = { "electric": True,
-                  "ac": True,
-                  "window": 15,
-                  "hysteresis": 1.0 }  # +- 1.0C before we attempt to correct the temperature (roughly 2F)
+    _settings = { "electric": True,         # Electric, or gas/oil?
+                  "ac": False,              # Air conditioning, or fan only?
+                  "window": 15,             # Statistics sampling window
+                  "hysteresis": 1.0,        # +- 1.0C before we attempt to correct the temperature (roughly 2F)
+                  "tickprint": False,       # Debug: Print ticks?
+                  "override_duration": 120, # Manual override duration, minimum
+                  "sensors": True,          # Allow activity-based overrides at all?
+                  "partial": True,          # Allow partial sensor activity, or all-or-nothing?
+                  "partial_duration": 5,    # Partial activity override remains active for at least this long
+                  "activity_duration": 15   # Activity override remains active for at least this long
+                }
 
-    # 'Read Only' settings
+
+    # Command verb for AWS IoT
+    _command = None
+
+    # 'Offline / Read Only' settings
     _pins = { "pir":     18,
               "mic":     23,
               "ctl": { "fan":     21,
@@ -154,7 +168,6 @@ class Thermostat:
         "default": TempConfig(temp=70.0, fan=False, heat=True, cooling=True)
     }
 
-
     ## Initialization ##    
     
     def __init__(self, electric=True, ac=False):
@@ -167,12 +180,13 @@ class Thermostat:
         self._mic = Sensor(self._pins['mic'])
         self._settings['electric'] = electric
         self._settings['ac'] = ac
+        # Before we start the schedule, install a handler to kill any async timers.
+        self._basesig = signal.signal(signal.SIGINT, self._sig)
         self.schedule_change()
         self.status()
         # If we use gas heat and have no A/C, nothing tries to engage the fan.
         # Force it on if so-configured.
         self._fan(False)
-
         
     ## Raw Thermostat control methods ##
     
@@ -269,28 +283,39 @@ class Thermostat:
     # Does not change the mode of the device (i.e. from manual/override to schedule.)
     def schedule_change(self):
         self.scheduled_program()
-        print "schedule_change invoked, current program: %s" % str(self._scheduled.get())
+        print "schedule_change invoked, currently scheduled program: %s" % str(self._scheduled.get())
         print "Next schedule change in %d minutes" % self._next
         self._timer = Timer(self._next * 60, self.schedule_change, ())
+        self._timer.setDaemon(True)
         self._timer.start()
 
     # Returns the current operating program settings.
     def program(self):
         if (self._mode == "manual"):
             return self._manual
-        elif (self._mode == "override"):
+        elif (self._mode == "activity"):
             if self._activity in self._overrides:
                 return self._overrides[self._activity]
         elif (self._mode == "schedule"):
             return self._scheduled
         # Mode is incorrect or override has a bad name
         return self._manual
+
+    def refresh(self):
+        print "Refreshing schedule"
+        if (self._timer):
+            self._timer.cancel()
+        self.schedule_change()
+        # Note: any changes to manual or overrides will be picked up by self.program() automatically.
+
+    # Clean up any timers on exit.
+    def _sig(self, signum, frame):
+        if self._timer:
+            self._timer.cancel()
+        self._basesig(signum, frame)
     
 
-
-    ## Dragons ##
-
-
+    ## Serialization and Deserialization methods for AWS IoT ##
 
     # Updates and returns the current status of the device.
     def status(self):
@@ -316,7 +341,7 @@ class Thermostat:
 
     # Returns the entire schedule.
     def schedule(self):
-        return self._schedule
+        return {d: [(ss[0], ss[1].get()) for ss in ds] for (d,ds) in self._schedule.items()}
 
     # Returns giant JSON blob representing all relevant state
     def state(self):
@@ -327,9 +352,19 @@ class Thermostat:
                 "manual": self._manual.get(),
                 "overrides": self.overrides()
             },
-            "data": self._statdata
+            "data": self._statdata,
+            "settings": self._settings,
+            "command": self._command
         }
         return self._state
+
+
+
+
+    ## DRAGONS ##
+
+
+    
 
     def _newAvg(self, key, new):
         n = self._statistics['nsamples']
@@ -360,41 +395,91 @@ class Thermostat:
         tdx = now - self._statistics['start']
         if (tdx.total_seconds() >= (self._settings['window'] * 60)):
             self._statdata = self._statistics
+            self._statdata['start'] = str(self._statistics['start'])
             self._statdata['end'] = str(now)
             self._statistics = None
             return True
         return False
 
+    def _activityClock(self, m):
+        expiry = datetime.datetime.now() + datetime.timedelta(minutes=m)
+        if ((self._expiryTime == None) or (expiry > self._expiryTime)):
+            self._expiryTime = expiry
 
-    _pp = pprint.PrettyPrinter(indent=4)
-    def tick(self):
+    def _expireActivity(self):
+        if (self._mode == "activity"):
+            print "Exiting activity override mode, re-entering normal schedule."
+            self._mode = "schedule"
+            self._expiryTime = None
+
+    def _activityMsg(self, msg):
+        dt = self._expiryTime - datetime.datetime.now()
+        print "%s. Expiry time is %s, in %.2f minutes" % (
+                str(msg),
+                str(self._expiryTime),
+                dt.total_seconds() / 60.0)
+            
+    def _checkActivity(self):
+        if not self._settings['sensors']:
+            self._expireActivity()
+            return
+
+        m = self.micState()
+        p = self.pirState()
+        act = False
+
+        if (m != p) and self._settings['partial']:
+            self._activityClock(self._settings['partial_duration'])
+            act = True
+        elif (m and p):
+            self._activityClock(self._settings['activity_duration'])
+            act = True
+
+        if (self._expiryTime):
+            if (self._expiryTime < datetime.datetime.now()):
+                self._expireActivity()
+            elif (self._mode == "schedule"):
+                self._activityMsg("Entering activity override mode")
+                self._mode = "activity"
+            elif (act != self._lastAct):
+                if not act:
+                    self._activityMsg("Activity ceased")
+                else:
+                    self._activityMsg("Activity resumed")
+
+        self._lastAct = act
+
+
+    def _checkThermo(self):
         prog = self.program()
-        ttu = self._updateStats()
-
         # Cool
         if (self._temp > (prog.temp() + self._settings['hysteresis'])) and prog.coolEnabled():
             self._cool(True)
         elif (self._temp < (prog.temp() - self._settings['hysteresis'])):
             self._cool(False)
-
         # Heat
         if (self._temp < (prog.temp() - self._settings['hysteresis'])) and prog.heatEnabled():
             self._heat(True)
         elif (self._temp > (prog.temp() + self._settings['hysteresis'])):
             self._heat(False)
 
+    _pp = pprint.PrettyPrinter(indent=4)
+    def tick(self, sleep=1.0):
+        ttu = self._updateStats()
+        self._checkActivity()
+        self._checkThermo()
+
+        if self._settings['tickprint']:
+            print "%s" % self.status()
+
         # TODO: Stat window has expired, push status to cloud
         if ttu:
-           print "%s" % self.state()
-                                              
+           self._pp.pprint(self.state())
+        time.sleep(sleep)
+
         
 if __name__ == "__main__":
     thermo = Thermostat()
-    print '%s' % str(thermo.overrides())
     thermo._pp.pprint(thermo.state())
-    
-    print 'Press Ctrl-C to quit.'
-    i = 0
     while True:
-        thermo.tick()
-	time.sleep(1.0)
+        thermo.tick(1.0)
