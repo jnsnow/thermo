@@ -43,13 +43,13 @@ class TempConfig(object):
     _fan = "auto"
     _heat = "auto"
     _cooling = "auto"
-    def __init__(self, temp=70.0, fan=False, heat=True, cooling=True):
+    def __init__(self, temp=70.0, fan=False, heat=True, cooling=True, **kwargs):
         self._temp = temp
         self._fan = "on" if fan else "auto"
         self._heat = "auto" if heat else "off"
-        self.cooling = "auto" if cooling else "off"
+        self._cooling = "auto" if cooling else "off"
     def __str__(self):
-        return self.get()
+        return str(self.get())
     def get(self):
         return { "temp": self._temp,
                  "fan": self._fan,
@@ -63,8 +63,24 @@ class TempConfig(object):
         return self._heat == "auto"
     def coolEnabled(self):
         return self._cooling == "auto"
-    def temp(self):
+    # Property Getter/Setters
+    def temp(self, t=None):
+        if t:
+            self._temp = float(t)
         return self._temp
+    def fan(self, f=None):
+        if f == "auto" or f == "on":
+            self._fan = f
+        return self._fan
+    def heat(self, h=None):
+        if h == "auto" or h == "off":
+            self._heat = h
+        return self._heat
+    def cooling(self, c=None):
+        if c == "auto" or c == "off":
+            self._cooling = c
+        return self._cooling
+
 
 def STC(t, *args, **kwargs):
     return ScheduleTempConfig(*args, temp=f_to_c(t), override="default", **kwargs)
@@ -76,11 +92,15 @@ class ScheduleTempConfig(TempConfig):
         self._override = override
         super(self.__class__,self).__init__(*args, **kwargs)
     def __str__(self):
-        return self.get()
+        return str(self.get())
     def get(self):
         tmp = super(self.__class__,self).get()
         tmp['override'] = self._override
         return tmp
+    def override(self, o=None):
+        if override:
+            _override = str(o)
+        return _override
 
 
 class Sensor:
@@ -291,7 +311,7 @@ class Thermostat:
             if k == "settings":
                 self._aws_settings(v)
             elif k == "program":
-                self._log("Unimplemented: PROGRAM update")
+                self._aws_program(v)
             elif k == "command":
                 self._aws_command(v)
             elif k == "status":
@@ -337,6 +357,47 @@ class Thermostat:
             self._expireManual()
         else:
             self._log("Ignoring unknown command '%s'" % cmd)
+
+    def _aws_program(self, program):
+        for (k,v) in program.items():
+            if k == "manual":
+                self._aws_manual(v)
+            elif k == "schedule":
+                self._log("Changing the schedule isn't implemented, sorry :(")
+                #print "<%s>" % str(v)
+            elif k == "overrides":
+                self._aws_manual(v)
+            else:
+                self._log("Ignoring unknown program section '%s'" % k)
+        self._log("Updated Thermostat Program")
+
+    def _progslice_update(self, pslice, nslice):
+        for (k,v) in nslice.items():
+            if k == "temp":
+                pslice.temp(float(v))
+            elif k == "heat":
+                pslice.heat(str(v))
+            elif k == "cooling":
+                pslice.cooling(str(v))
+            elif k == "fan":
+                pslice.fan(str(v))
+            else:
+                self._log("Ignoring unknown manual program setting '%s'" % k)        
+
+    def _aws_manual(self, m):
+        self._progslice_update(self._manual, m)
+        self._log("Updated manual thermostat program.")
+
+    def _aws_activities(self, a):
+        for (k,v) in a.items():
+            if k in self._overrides:
+                self._progslice_update(self._overrides[k], v)
+            elif len(self._overrides) < 10:
+                self._overrides[k] = TempConfig(**v)
+            else:
+                self._log("Cannot name more than 10 activity override slices, sorry!")
+        self._log("Updated activity override program.")
+        
 
     ## Raw Thermostat control methods ##
     
@@ -477,7 +538,8 @@ class Thermostat:
             "pir":      self.pirState(),
             "time":     str(datetime.datetime.now()),
             "mode":     self._mode,
-            "activity": self._activity
+            "activity": self._activity,
+            "target":   self.program().get()
         }
         return self._status
 
@@ -607,7 +669,7 @@ class Thermostat:
                 self._activity = prog['override']
                 self._mode = "activity"
                 self._log("Entering activity override mode. Program: %s" % self.program().get())
-            elif (act != self._lastAct):
+            elif (act != self._lastAct) and self._mode == "activity":
                 if not act:
                     self._activityMsg("Activity ceased")
                 else:
