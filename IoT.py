@@ -12,6 +12,9 @@ import pprint
 import time
 from threading import Timer
 import signal
+import paho.mqtt.client as mqtt
+import ssl
+import json
 
 # Relay settings
 # Port 1: Green Wire. GPIO 21
@@ -63,6 +66,9 @@ class TempConfig(object):
     def temp(self):
         return self._temp
 
+def STC(t, *args, **kwargs):
+    return ScheduleTempConfig(*args, temp=f_to_c(t), override="default", **kwargs)
+
 
 class ScheduleTempConfig(TempConfig):
     _override = None
@@ -89,6 +95,9 @@ class Sensor:
 
 
 class Thermostat:
+    # mqtt state
+    _mqttc = None
+    
     # Sensor Objects
     _sensor = None
     _pir = None
@@ -135,19 +144,21 @@ class Thermostat:
     ### Schedule and Programming Data ###
 
     # Generic default weekday schedule (No PID)
-    _weekday = [(0, ScheduleTempConfig(temp=f_to_c(60.0))),    #12:00AM: 60F
-                (360, ScheduleTempConfig(temp=f_to_c(65.0))),  #6:00AM: 65F
-                (420, ScheduleTempConfig(temp=f_to_c(70.0))),  #7:00AM: 70F
-                (600, ScheduleTempConfig(temp=f_to_c(60.0))),  #10:00AM: 60F
-                (960, ScheduleTempConfig(temp=f_to_c(65.0))),  #4:00PM: 65F
-                (1020, ScheduleTempConfig(temp=f_to_c(70.0))), #5:00PM: 70F
-                (1380, ScheduleTempConfig(temp=f_to_c(60.0)))] #11:00PM: 60F
+    _weekday = [(0,    STC(60)), #12:00AM: 60F
+                (360,  STC(65)), #6:00AM: 65F
+                (420,  STC(70)), #7:00AM: 70F
+                (600,  STC(60)), #10:00AM: 60F
+                (960,  STC(65)), #4:00PM: 65F
+                (1020, STC(70)), #5:00PM: 70F
+                (1380, STC(60))  #11:00PM: 60F
+               ]
 
     # Generic default weekend schedule
-    _weekend = [(0, ScheduleTempConfig(temp=f_to_c(60.0))),    #12:00AM: 60F
-                (480, ScheduleTempConfig(temp=f_to_c(65.0))),  #8:00AM: 65F
-                (540, ScheduleTempConfig(temp=f_to_c(70.0))),  #9:00AM: 70F
-                (1380, ScheduleTempConfig(temp=f_to_c(60.0)))] #11:00PM: 60F
+    _weekend = [(0,    STC(60)), #12:00AM: 60F
+                (480,  STC(65)), #08:00AM: 65F
+                (540,  STC(70)), #09:00AM: 70F
+                (1380, STC(60))  #11:00PM: 60F
+               ]
 
     # Default schedule: Weekdays and Weekends.
     _schedule = {
@@ -161,11 +172,11 @@ class Thermostat:
     }
 
     # Manual override settings
-    _manual = TempConfig(temp=70.0, fan=False, heat=True, cooling=True)
+    _manual = TempConfig(temp=21.11, fan=False, heat=True, cooling=True)
     
     # Activity override settings
     _overrides = {
-        "default": TempConfig(temp=70.0, fan=False, heat=True, cooling=True)
+        "default": TempConfig(temp=21.667, fan=False, heat=True, cooling=True)
     }
 
     ## Initialization ##    
@@ -174,6 +185,9 @@ class Thermostat:
         GPIO.setmode(GPIO.BCM)
         for k,v in self._pins['ctl'].items():
             GPIO.setup(v, GPIO.OUT, initial=GPIO.LOW)
+
+        self._mqtt_init()
+            
         self._sensor = MCP9808.MCP9808()
         self._sensor.begin()
         self._pir = Sensor(self._pins['pir'])
@@ -187,12 +201,138 @@ class Thermostat:
         # If we use gas heat and have no A/C, nothing tries to engage the fan.
         # Force it on if so-configured.
         self._fan(False)
-        
+
+    ## MQTT (AWS IoT) methods ##
+
+    def _mqtt_init(self):
+        m = mqtt.Client(client_id="rpithermo")
+        m.on_connect = self._mqtt_connect
+        m.on_subscribe = self._mqtt_subscribe
+        m.on_message = self._mqtt_message
+        m.tls_set(ca_certs="/etc/ssl/certs/ca-certificates.crt",
+                  certfile="/home/pi/.keys/da90ba97b5-certificate.pem.crt",
+                  keyfile="/home/pi/.keys/da90ba97b5-private.pem.key",
+                  tls_version=ssl.PROTOCOL_TLSv1_2)
+        m.connect("A3S46MRJUBJIPY.iot.us-east-1.amazonaws.com", port=8883)
+        m.loop_start()
+        self._mqttc = m
+                            
+
+    def _mqtt_connect(self, mqtcc, obj, flags, rc):
+        self._log("Subscriber Connection status code: %d; Connection status: %s" % (
+                  rc, "Successful" if rc == 0 else "Refused"))
+        if rc == 0:
+            (_, m) = mqtcc.subscribe("$aws/things/thermo/shadow/update/delta", qos=1)
+            (_, m) = mqtcc.subscribe("$aws/things/thermo/shadow/get/accepted", qos=1)
+            self._getmid = m
+
+    def _mqtt_subscribe(self, mqttc, obj, mid, granted_qos):
+        self._log("Subscribed: mid: '%s'; qos: '%s'; data: '%s'" % (
+                  str(mid),
+                  str(granted_qos),
+                  str(obj)))
+        if mid == self._getmid:
+            self._mqtt_retrieve()
+
+    def _mqtt_message(self, mqtt, obj, msg):
+        self._log("Received message from topic '%s', QoS '%d'" % (
+                str(msg.topic),
+                msg.qos))
+        if msg.topic == "$aws/things/thermo/shadow/update/delta":
+            dobj = json.loads(msg.payload)
+            if 'state' not in dobj:
+                self._log("MQTT status update did not include 'state' section, ignoring")
+                return
+            self._aws_update(dobj['state'])
+        if msg.topic == "$aws/things/thermo/shadow/get/accepted":
+            dobj = json.loads(msg.payload)
+            if 'state' not in dobj:
+                self._log("MQTT reply did not include 'state' section, ignoring")
+                return
+            dobj = dobj['state']
+            for (t, b) in dobj.items():
+                if (t == "reported"):
+                    self._aws_update(b)
+                else:
+                    self._log("Ignoring '%s' update section from AWS" % t)
+        self._mqtt_publish()
+
+    def _mqtt_publish(self):
+        self._log("Publishing to AWS IoT")
+        self._mqttc.publish("$aws/things/thermo/shadow/update",
+                            json.dumps(self.state()),
+                            qos=1)
+
+    def _mqtt_publish_stats(self):
+        self._log("Publishing statistics to AWS IoT")
+        self._mqttc.publish("$aws/things/thermo/shadow/update",
+                            json.dumps({"state": {"reported": {"data": self._statdata}}}),
+                            qos=1)
+
+    def _mqtt_retrieve(self):
+        self._log("Asking AWS IoT for Shadow")
+        self._mqttc.publish("$aws/things/thermo/shadow/get",
+                            json.dumps({"hello": "world"}),
+                            qos=1)
+
+    ## Cloud Update Methods ##
+
+    def _aws_update(self, desired):
+        for (k,v) in desired.items():
+            if k == "settings":
+                self._aws_settings(v)
+            elif k == "program":
+                self._log("Unimplemented: PROGRAM update")
+            elif k == "command":
+                self._aws_command(v)
+            elif k == "status":
+                self._log("Ignoring read-only update to 'status' from MQTT")
+            elif k == "data":
+                self._log("Ignoring read-only update to 'data' from MQTT")
+            else:
+                self._log("Ignoring update to unknown field '%s' from MQTT" % k)
+        self._log("Finished updating state from MQTT")
+
+    def _aws_settings(self, settings):
+        for (k,v) in settings.items():
+            if k == "electric":
+                self._settings[k] = bool(v)
+            elif k == "ac":
+                self._settings[k] = bool(v)
+            elif k == "window":
+                self._settings[k] = int(v)
+            elif k == "hysteresis":
+                self._settings[k] = float(v)
+            elif k == "tickprint":
+                self._settings[k] = bool(v)
+            elif k == "override_duration":
+                self._settings[k] = int(v)
+            elif k == "sensors":
+                self._settings[k] = bool(v)
+            elif k == "partial":
+                self._settings[k] = bool(v)
+            elif k == "partial_duration":
+                self._settings[k] = int(v)
+            elif k == "activity_duration":
+                self._settings[k] = int(v)
+            else:
+                self._log("Ignoring unknown setting %s=%s" % (k, v))
+        self._log("Updated settings")
+
+    def _aws_command(self, cmd):
+        if cmd == "refresh":
+            self.refresh()
+        elif cmd == "manual":
+            self._log("MANUAL CONTROLS ENGAGED")
+            self._mode = "manual"
+        else:
+            self._log("Ignoring unknown command '%s'" % cmd)
+
     ## Raw Thermostat control methods ##
     
     def _heatpin(self, high=True):
         if (self.heatState() != high):
-            print "HEAT: Transition from %s to %s" % (self.heatState(), high)
+            self._log("HEAT: Transition from %s to %s" % (self.heatState(), high))
         GPIO.output(self._pins['ctl']['heat'],
                     GPIO.HIGH if high else GPIO.LOW)
         self._demopin(high)
@@ -203,13 +343,13 @@ class Thermostat:
 
     def _coolpin(self, high=True):
         if (self.coolState() != high):
-            print "COOL: Transition from %s to %s" % (self.coolState(), high)
+            self._log("COOL: Transition from %s to %s" % (self.coolState(), high))
         GPIO.output(self._pins['ctl']['cooling'],
                     GPIO.HIGH if high else GPIO.LOW)
 
     def _fanpin(self, high=True):
         if (self.fanState() != high):
-            print "FAN: Transition from %s to %s" % (self.fanState(), high)
+            self._log("FAN: Transition from %s to %s" % (self.fanState(), high))
         GPIO.output(self._pins['ctl']['fan'],
                     GPIO.HIGH if high else GPIO.LOW)
 
@@ -283,8 +423,8 @@ class Thermostat:
     # Does not change the mode of the device (i.e. from manual/override to schedule.)
     def schedule_change(self):
         self.scheduled_program()
-        print "schedule_change invoked, currently scheduled program: %s" % str(self._scheduled.get())
-        print "Next schedule change in %d minutes" % self._next
+        self._log("schedule_change invoked, currently scheduled program: %s" % str(self._scheduled.get()))
+        self._log("Next schedule change in %d minutes" % self._next)
         self._timer = Timer(self._next * 60, self.schedule_change, ())
         self._timer.setDaemon(True)
         self._timer.start()
@@ -296,13 +436,12 @@ class Thermostat:
         elif (self._mode == "activity"):
             if self._activity in self._overrides:
                 return self._overrides[self._activity]
-        elif (self._mode == "schedule"):
-            return self._scheduled
-        # Mode is incorrect or override has a bad name
-        return self._manual
+        # Mode is "schedule", something unrecognized,
+        # or the override name is incorrect.
+        return self._scheduled
 
     def refresh(self):
-        print "Refreshing schedule"
+        self._log("Refreshing schedule")
         if (self._timer):
             self._timer.cancel()
         self.schedule_change()
@@ -352,20 +491,20 @@ class Thermostat:
                 "manual": self._manual.get(),
                 "overrides": self.overrides()
             },
-            "data": self._statdata,
             "settings": self._settings,
             "command": self._command
         }
-        return self._state
+        if self._statdata:
+            self._state['data'] = self._statdata
+        return {"state": {"reported": self._state, "desired": None }}
 
 
-
-
-    ## DRAGONS ##
-
-
+    ## Thermo Mainloop Functions
     
 
+    def _log(self, msg):
+        print "[%s] %s" % (str(datetime.datetime.now()), msg)
+            
     def _newAvg(self, key, new):
         n = self._statistics['nsamples']
         avg = ((self._statistics[key] * n) + new) / (n + 1)
@@ -408,22 +547,31 @@ class Thermostat:
 
     def _expireActivity(self):
         if (self._mode == "activity"):
-            print "Exiting activity override mode, re-entering normal schedule."
             self._mode = "schedule"
             self._expiryTime = None
+            self._log("Exiting activity override mode, re-entering normal schedule; %s" %
+                      self.program().get())
+            self._activity = None
 
     def _activityMsg(self, msg):
         dt = self._expiryTime - datetime.datetime.now()
-        print "%s. Expiry time is %s, in %.2f minutes" % (
-                str(msg),
-                str(self._expiryTime),
-                dt.total_seconds() / 60.0)
+        self._log("%s. Expiry time is %s, in %.2f minutes" % (
+                  str(msg),
+                  str(self._expiryTime),
+                  dt.total_seconds() / 60.0))
             
     def _checkActivity(self):
+        # User has requested no activity overrides globally. Ignore.
         if not self._settings['sensors']:
             self._expireActivity()
             return
 
+        # No override configured for the current schedule. Ignore.
+        prog = self._scheduled.get()
+        if not 'override' in prog:
+            self._expireActivity()
+            return
+        
         m = self.micState()
         p = self.pirState()
         act = False
@@ -439,13 +587,14 @@ class Thermostat:
             if (self._expiryTime < datetime.datetime.now()):
                 self._expireActivity()
             elif (self._mode == "schedule"):
-                self._activityMsg("Entering activity override mode")
+                self._activity = prog['override']
                 self._mode = "activity"
+                self._log("Entering activity override mode. Program: %s" % self.program().get())
             elif (act != self._lastAct):
                 if not act:
                     self._activityMsg("Activity ceased")
                 else:
-                    self._activityMsg("Activity resumed")
+                    self._log("Sensor activity resumed")
 
         self._lastAct = act
 
@@ -470,16 +619,20 @@ class Thermostat:
         self._checkThermo()
 
         if self._settings['tickprint']:
-            print "%s" % self.status()
+            self._log(str(self.status()))
 
-        # TODO: Stat window has expired, push status to cloud
         if ttu:
-           self._pp.pprint(self.state())
+            self._mqtt_publish_stats()
+
         time.sleep(sleep)
 
-        
+
+
+## 3, 2, 1: Showtime! ##
+
+
+
 if __name__ == "__main__":
     thermo = Thermostat()
-    thermo._pp.pprint(thermo.state())
     while True:
         thermo.tick(1.0)
