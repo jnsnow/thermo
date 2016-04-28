@@ -569,7 +569,14 @@ class Thermostat:
                   str(msg),
                   str(self._expiryTime),
                   dt.total_seconds() / 60.0))
-            
+
+    def _checkManual(self):
+        if self._mode == "manual":
+            if self._resumeTime and self._tickTime > self._resumeTime:
+                self._expireManual()
+            elif not self._resumeTime:
+                self._expireManual()
+
     def _checkActivity(self):
         # User has requested no activity overrides globally. Ignore.
         if not self._settings['sensors']:
@@ -642,7 +649,9 @@ class Thermostat:
 
     _pp = pprint.PrettyPrinter(indent=4)
     def tick(self, sleep=1.0):
+        self._tickTime = datetime.datetime.now()
         ttu = self._updateStats()
+        self._checkManual()
         self._checkActivity()
         self._checkThermo()
 
