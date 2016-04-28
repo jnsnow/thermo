@@ -114,6 +114,7 @@ class Thermostat:
     _statistics = None  # Statistics for the current window
     _timer = None       # Timer obj for schedule change.
     _expiryTime = None  # Time at which activity mode, if enabled, will expire
+    _resumeTime = None  # Time at which override mode, if enabled, will expire
     _lastAct = False    # Previous activity state
 
     # Settings
@@ -213,7 +214,9 @@ class Thermostat:
                   certfile="/home/pi/.keys/da90ba97b5-certificate.pem.crt",
                   keyfile="/home/pi/.keys/da90ba97b5-private.pem.key",
                   tls_version=ssl.PROTOCOL_TLSv1_2)
-        m.connect("A3S46MRJUBJIPY.iot.us-east-1.amazonaws.com", port=8883)
+        rsp = m.connect("A3S46MRJUBJIPY.iot.us-east-1.amazonaws.com", port=8883)
+        if rsp != 0:
+            self._log("MQTT connect failed.")
         m.loop_start()
         self._mqttc = m
                             
@@ -245,16 +248,21 @@ class Thermostat:
                 return
             self._aws_update(dobj['state'])
         if msg.topic == "$aws/things/thermo/shadow/get/accepted":
+            if not self._askShadow:
+                # "I didn't ask for this."
+                return
             dobj = json.loads(msg.payload)
             if 'state' not in dobj:
                 self._log("MQTT reply did not include 'state' section, ignoring")
                 return
             dobj = dobj['state']
-            for (t, b) in dobj.items():
-                if (t == "reported"):
-                    self._aws_update(b)
-                else:
-                    self._log("Ignoring '%s' update section from AWS" % t)
+            if "reported" in dobj:
+                self._aws_update(dobj['reported'])
+            else:
+                self._log("Reported section absent from AWS.")
+            if "delta" in dobj:
+                self._aws_update(dobj['delta'])
+            self._askShadow = False
         self._mqtt_publish()
 
     def _mqtt_publish(self):
@@ -270,9 +278,10 @@ class Thermostat:
                             qos=1)
 
     def _mqtt_retrieve(self):
+        self._askShadow = True
         self._log("Asking AWS IoT for Shadow")
         self._mqttc.publish("$aws/things/thermo/shadow/get",
-                            json.dumps({"hello": "world"}),
+                            json.dumps({}),
                             qos=1)
 
     ## Cloud Update Methods ##
@@ -323,8 +332,9 @@ class Thermostat:
         if cmd == "refresh":
             self.refresh()
         elif cmd == "manual":
-            self._log("MANUAL CONTROLS ENGAGED")
-            self._mode = "manual"
+            self._engageManual()
+        elif cmd == "resume":
+            self._expireManual()
         else:
             self._log("Ignoring unknown command '%s'" % cmd)
 
@@ -598,7 +608,25 @@ class Thermostat:
 
         self._lastAct = act
 
-
+    def _engageManual(self):
+        self._resumeTime = datetime.datetime.now() + datetime.timedelta(
+                               minutes=self._settings['override_duration'])
+        self._log("Entering manual override mode. Expiry is %s, in %.2f minutes." % (
+                  str(self._resumeTime),
+                  (self._resumeTime - datetime.datetime.now()).total_seconds() / 60.0))
+        self._mode = "manual"
+        
+    # Called to retire the Manual override.
+    def _expireManual(self):
+        if self._expiryTime and self._expiryTime < datetime.datetime.now():
+            self._log("Leaving manual override mode. Returning to activity override.")
+            self._mode = "activity"
+        else:
+            self._expiryTime = None
+            self._log("Leaving manual override mode. Returning to regular schedule.")
+            self._mode = "schedule"
+        self._resumeTime = None
+        
     def _checkThermo(self):
         prog = self.program()
         # Cool
